@@ -37,7 +37,7 @@ pack_all_objs() {
     BASEDIR="$1"
     FIND="$2"
     MAIN_DIR="$BASEDIR/sysroot-$SCHEME-$MAIN_ARCH"
-    LIST=$(find "$MAIN_DIR" -path "$FIND" -type f)
+    LIST=$(find "$MAIN_DIR" -path "$FIND" -not -path "$MAIN_DIR/host/*" -type f)
     OLDIFS=$IFS
     IFS=$'\n'
     for f in $LIST
@@ -72,6 +72,7 @@ pack_dir() {
     cp -a "$SRC/$DIR" "$TGT/$DIR"
 }
 
+pack_all_objs "$BASEDIR" "*/libexec/virgl_render_server"
 pack_all_objs "$BASEDIR" "*/bin/qemu-*"
 pack_all_objs "$BASEDIR" "*/lib/*.dylib"
 pack_all_objs "$BASEDIR" "*/lib/*.a"

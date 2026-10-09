@@ -31,6 +31,7 @@
 #if !defined(WITH_REMOTE)
 #include "UTMProcess.h"
 #include "UTMQemuSystem.h"
+#include "QEMUHelperProtocol.h"
 #include "UTMJailbreak.h"
 #else
 #include "UTMQemuSystemBackends.h"
@@ -47,7 +48,6 @@
 #include "VMDisplayMetalViewController.h"
 #include "VMDisplayMetalViewController+Keyboard.h"
 //#endif
-#include "VMKeyboardButton.h"
 #include "VMKeyboardView.h"
 #elif TARGET_OS_OSX
 typedef uint32_t CGSConnectionID;

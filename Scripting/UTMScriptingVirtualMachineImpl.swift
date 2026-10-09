@@ -26,6 +26,13 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
         box.wrapped
     }
     
+    /// Installations started by `install`, kept after they finish so that the result can be queried
+    @nonobjc private static var installations: [UUID: Installation] = [:]
+    
+    @nonobjc var isInstalling: Bool {
+        Self.installations[vm.id]?.isFinished == false
+    }
+    
     @objc var id: String {
         vm.id.uuidString
     }
@@ -84,6 +91,28 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
         }
     }
     
+    @objc var snapshots: [UTMScriptingSnapshotImpl] {
+        UTMSnapshotService.snapshots(for: vm).map { UTMScriptingSnapshotImpl(snapshot: $0, parent: self) }
+    }
+
+    /// Resolve `snapshot id "..." of virtual machine ...`
+    ///
+    /// Without this a specifier for a snapshot cannot be evaluated and falls back to this virtual
+    /// machine, which would aim a command meant for one snapshot at the whole VM.
+    @objc(valueInSnapshotsWithUniqueID:)
+    func valueInSnapshots(withUniqueID id: Any) -> UTMScriptingSnapshotImpl? {
+        guard let id = id as? String else {
+            return nil
+        }
+        return snapshots.first { $0.id == id }
+    }
+
+    /// Resolve `snapshot "..." of virtual machine ...`
+    @objc(valueInSnapshotsWithName:)
+    func valueInSnapshots(withName name: String) -> UTMScriptingSnapshotImpl? {
+        snapshots.first { $0.name == name }
+    }
+
     var guestAgent: QEMUGuestAgent! {
         get async {
             await (vm as? UTMQemuVirtualMachine)?.guestAgent
@@ -112,10 +141,20 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
     @objc func start(_ command: NSScriptCommand) {
         let shouldSaveState = command.evaluatedArguments?["saveFlag"] as? Bool ?? true
         let bootRecoveryMode = command.evaluatedArguments?["bootRecoveryFlag"] as? Bool ?? false
+        let hasProvisioning = command.evaluatedArguments?["provisioningOptions"] != nil
+        let provisioning = command.evaluatedArguments?["provisioningOptions"] as? [AnyHashable : Any]
 
         withScriptCommand(command) { [self] in
             var options: UTMVirtualMachineStartOptions = []
 
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
+            // the first boot cannot be repeated so never fall back to a normal start
+            guard provisioning != nil || !hasProvisioning else {
+                throw ScriptingError.invalidParameter
+            }
+            
             if !shouldSaveState {
                 guard type(of: vm).capabilities.supportsDisposibleMode else {
                     throw ScriptingError.operationNotSupported
@@ -129,8 +168,31 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
                 options.insert(.bootRecovery)
             }
 
+            var guestProvisioning: UTMAppleGuestProvisioningOptions?
+            if let provisioning = provisioning {
+                guard let vm = vm as? UTMAppleVirtualMachine else {
+                    throw ScriptingError.operationNotSupported
+                }
+                guard let username = provisioning["username"] as? String, !username.isEmpty, let password = provisioning["password"] as? String else {
+                    throw ScriptingError.invalidParameter
+                }
+                guard vm.state == .stopped else {
+                    throw ScriptingError.operationNotAvailable
+                }
+                let account = UTMAppleGuestProvisioningOptions(fullName: provisioning["fullName"] as? String ?? username,
+                                                               username: username,
+                                                               password: password,
+                                                               logsInAutomatically: provisioning["automaticLogin"] as? Bool ?? false,
+                                                               enablesRemoteLogin: provisioning["remoteLogin"] as? Bool ?? false)
+                // report mistakes before a window is opened
+                try await vm.validateGuestProvisioning(account, options: options)
+                guestProvisioning = account
+            }
+            
             data.run(vm: box, startImmediately: false)
-            if vm.state == .stopped {
+            if let guestProvisioning = guestProvisioning, let vm = vm as? UTMAppleVirtualMachine {
+                try await vm.start(options: options, guestProvisioning: guestProvisioning)
+            } else if vm.state == .stopped {
                 try await vm.start(options: options)
             } else if vm.state == .paused {
                 try await vm.resume()
@@ -140,9 +202,73 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
         }
     }
     
+    /// Start installing macOS from the configured IPSW
+    ///
+    /// Unlike the GUI, this does not ask for confirmation because the caller already requested it.
+    /// The installation takes longer than the Apple Event timeout so it continues after this returns.
+    @objc func install(_ command: NSScriptCommand) {
+        withScriptCommand(command) { [self] in
+            guard #available(macOS 12, *) else {
+                throw ScriptingError.operationNotSupported
+            }
+            guard let appleVM = vm as? UTMAppleVirtualMachine else {
+                throw ScriptingError.operationNotSupported
+            }
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
+            // installVM() silently does nothing if the VM is not stopped
+            guard appleVM.state == .stopped else {
+                throw ScriptingError.notStopped
+            }
+            guard let ipsw = appleVM.config.system.boot.macRecoveryIpswURL else {
+                throw ScriptingError.macRecoveryIpswNotConfigured
+            }
+            let installation = Installation()
+            Self.installations[appleVM.id] = installation
+            Task { @MainActor in
+                do {
+                    try await appleVM.installVM(with: ipsw)
+                    // there is no window to do this in didCompleteInstallation
+                    appleVM.config.system.boot.macRecoveryIpswURL = nil
+                    appleVM.registryEntry.macRecoveryIpsw = nil
+                    // the VM stops by itself shortly after and cannot be started before then
+                    for await state in box.$state.values where state == .stopped {
+                        break
+                    }
+                } catch {
+                    installation.error = error
+                }
+                installation.isFinished = true
+            }
+        }
+    }
+    
+    @objc func queryInstall(_ command: NSScriptCommand) {
+        withScriptCommand(command) { [self] in
+            guard let appleVM = vm as? UTMAppleVirtualMachine else {
+                throw ScriptingError.operationNotSupported
+            }
+            guard let installation = Self.installations[appleVM.id] else {
+                throw ScriptingError.installNotStarted
+            }
+            if let error = installation.error {
+                throw error
+            }
+            let progress = installation.isFinished ? 1.0 : appleVM.installProgress?.fractionCompleted ?? 0.0
+            return [
+                "isInstalling": !installation.isFinished,
+                "progress": progress,
+            ]
+        }
+    }
+    
     @objc func suspend(_ command: NSScriptCommand) {
         let shouldSaveState = command.evaluatedArguments?["saveFlag"] as? Bool ?? false
         withScriptCommand(command) { [self] in
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
             guard vm.state == .started else {
                 throw ScriptingError.notRunning
             }
@@ -161,6 +287,14 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
             stopMethod = .force
         }
         withScriptCommand(command) { [self] in
+            if isInstalling {
+                // like in the GUI, stopping cancels the installation once it is underway
+                guard let appleVM = vm as? UTMAppleVirtualMachine, appleVM.installProgress != nil || appleVM.state == .started else {
+                    throw ScriptingError.installInProgress
+                }
+                try await appleVM.stop(usingMethod: .force)
+                return
+            }
             guard vm.state == .started || stopMethod == .kill else {
                 throw ScriptingError.notRunning
             }
@@ -175,18 +309,59 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
         }
     }
     
+    @objc func createSnapshot(_ command: NSScriptCommand) {
+        let name = command.evaluatedArguments?["snapshotName"] as? String
+        withScriptCommand(command) { [self] in
+            let snapshot = try await UTMSnapshotService.createSnapshot(title: name, on: vm)
+            return UTMScriptingSnapshotImpl(snapshot: snapshot, parent: self)
+        }
+    }
+
+    @objc func scanSnapshots(_ command: NSScriptCommand) {
+        withScriptCommand(command) { [self] in
+            try await UTMSnapshotService.scanSnapshots(on: vm)
+        }
+    }
+
+    @objc func discardSavedState(_ command: NSScriptCommand) {
+        withScriptCommand(command) { [self] in
+            guard vm.registryEntry.isSuspended else {
+                return
+            }
+            try await vm.deleteSnapshot(name: nil)
+        }
+    }
+
     @objc func delete(_ command: NSDeleteCommand) {
         withScriptCommand(command) { [self] in
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
             guard vm.state == .stopped else {
                 throw ScriptingError.notStopped
             }
             try await data.delete(vm: box, alsoRegistry: true)
         }
     }
+
+    @objc func reloadConfiguration(_ command: NSScriptCommand) {
+        withScriptCommand(command) { [self] in
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
+            guard vm.state == .stopped else {
+                throw ScriptingError.notStopped
+            }
+            try data.discardChanges(for: box)
+        }
+    }
     
     @objc func clone(_ command: NSCloneCommand) {
         let properties = command.evaluatedArguments?["WithProperties"] as? [AnyHashable : Any]
         withScriptCommand(command) { [self] in
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
             guard vm.state == .stopped else {
                 throw ScriptingError.notStopped
             }
@@ -202,6 +377,9 @@ class UTMScriptingVirtualMachineImpl: NSObject, UTMScriptable {
     @objc func export(_ command: NSCloneCommand) {
         let exportUrl = command.evaluatedArguments?["file"] as? URL
         withScriptCommand(command) { [self] in
+            guard !isInstalling else {
+                throw ScriptingError.installInProgress
+            }
             guard vm.state == .stopped else {
                 throw ScriptingError.notStopped
             }
@@ -392,6 +570,9 @@ extension UTMScriptingVirtualMachineImpl {
         case notStopped
         case guestAgentNotRunning
         case invalidParameter
+        case macRecoveryIpswNotConfigured
+        case installInProgress
+        case installNotStarted
         
         var errorDescription: String? {
             switch self {
@@ -401,7 +582,19 @@ extension UTMScriptingVirtualMachineImpl {
             case .notStopped: return NSLocalizedString("The virtual machine must be stopped before this operation can be performed.", comment: "UTMScriptingVirtualMachineImpl")
             case .guestAgentNotRunning: return NSLocalizedString("The QEMU guest agent is not running or not installed on the guest.", comment: "UTMScriptingVirtualMachineImpl")
             case .invalidParameter: return NSLocalizedString("One or more required parameters are missing or invalid.", comment: "UTMScriptingVirtualMachineImpl")
+            case .macRecoveryIpswNotConfigured: return NSLocalizedString("This virtual machine has no IPSW recovery image configured, so there is nothing to install from.", comment: "UTMScriptingVirtualMachineImpl")
+            case .installInProgress: return NSLocalizedString("This operation cannot be performed while macOS is being installed.", comment: "UTMScriptingVirtualMachineImpl")
+            case .installNotStarted: return NSLocalizedString("No installation was started for this virtual machine.", comment: "UTMScriptingVirtualMachineImpl")
             }
         }
+    }
+}
+
+// MARK: - Installation
+extension UTMScriptingVirtualMachineImpl {
+    @MainActor
+    private class Installation {
+        var isFinished = false
+        var error: Error?
     }
 }
